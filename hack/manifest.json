@@ -1,0 +1,19 @@
+{
+	"manifest_version": 3,
+	"name": "Chess.com Background Script",
+	"version": "1.0",
+	"content_scripts": [
+		{
+			"matches": [
+				"*://*.chess.com/*"
+			],
+			"js": [
+				"script.js"
+			]
+		}
+	],
+	"permissions": [
+		"activeTab",
+		"debugger"
+	]
+}
