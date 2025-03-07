@@ -1,5 +1,8 @@
 #include "chess.hpp"
 #include <chrono>
+#include <unistd.h>
+#include <string.h>
+#include <poll.h>
 
 /// Parameters
 
@@ -18,6 +21,23 @@ typedef double t_score;
 #define SCORE_ZERO 0
 #define SCORE_MIN -1000000000
 #define SCORE_MAX 1000000000
+
+chess::Board board;
+
+std::vector<std::string> split(std::string str, char delim) {
+    std::vector<std::string> parts;
+    std::string part = "";
+    for (char c : str) {
+        if (c == delim) {
+            parts.push_back(part);
+            part = "";
+        } else {
+            part += c;
+        }
+    }
+    parts.push_back(part);
+    return parts;
+}
 
 bool isCheck(chess::Move &move, chess::Board &board) {
 	board.makeMove(move);
@@ -441,12 +461,172 @@ void storeTT(uint64_t key, int depth, t_score score, TTFlag flag, chess::Move be
 	}
 }
 
+typedef enum {
+	WAITING,
+	THINKING,
+	CANCELLING,
+} t_state;
+
+t_state state = WAITING;
+chess::Move bestLine[MAX_DEPTH];
+size_t bestLineLength = 0;
+
+void cancelSearch(void) {
+	std::cout << "info string cancelling search" << std::endl;
+	state = CANCELLING;
+}
+
+void handleCommand(char *input) {
+	if (strcmp(input, "uci") == 0) {
+		std::cout << "uciok" << std::endl;
+	} else if (strcmp(input, "isready") == 0) {
+		std::cout << "readyok" << std::endl;
+	} else if (strcmp(input, "ucinewgame") == 0) {
+#if TT
+		transpositionTable.clear();
+#endif
+	} else if (strcmp(input, "position") == 0) {
+		std::string moves = std::string(input).substr(24);
+		board = chess::Board::fromFen(std::string_view("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
+		std::vector<std::string> moveList = split(moves, ' ');
+		for (std::string moveStr : moveList) {
+			auto move = chess::uci::uciToMove(board, moveStr);
+			board.makeMove(move);
+		}
+		auto lastMove = chess::uci::uciToMove(board, moveList.back());
+		// cancel if we're not pondering this move
+		if (bestLine[0] != lastMove) {
+			cancelSearch();
+		}
+
+		state = THINKING;
+	} else if (strcmp(input, "go") == 0) {
+		// dont do anything. for now, position starts the search
+	} else if (strcmp(input, "stop") == 0) {
+		cancelSearch();
+	} else if (strcmp(input, "quit") == 0) {
+		exit(0);
+	}
+}
+
+bool commandAvailable() {
+	struct pollfd fds;
+	fds.fd = 0;
+	fds.events = POLLIN;
+	fds.revents = 0;
+
+	return poll(&fds, 1, 0) > 0;
+}
+
+std::string readCommand() {
+	std::string command;
+	std::getline(std::cin, command);
+	return command;
+}
+
+t_score search(chess::Board &board);
+
+void startSearch() {
+	assert(state != THINKING);
+
+	std::cout << "info string starting search" << std::endl;
+	state = THINKING;
+	bestLineLength = 0;
+	auto score = search(board);
+	std::cout << "info string best line: ";
+	for (size_t i = 0; i < bestLineLength; i++) {
+		std::cout << chess::uci::moveToUci(bestLine[i]) << " ";
+	}
+	std::cout << std::endl;
+	std::cout << "bestmove " << chess::uci::moveToUci(bestLine[0]) << std::endl;
+	state = WAITING;
+}
+
+void updateState() {
+	/*
+	std::string input;
+	std::getline(std::cin, input);
+
+	if (input == "uci") {
+		std::cout << "uciok" << std::endl;
+	} else if (input == "isready") {
+		std::cout << "readyok" << std::endl;
+	} else if (input.starts_with("position startpos moves")) {
+		std::string moves = input.substr(24);
+		board = chess::Board::fromFen(std::string_view("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
+		std::vector<std::string> moveList = split(moves, ' ');
+		for (std::string moveStr : moveList) {
+			auto move = chess::uci::uciToMove(board, moveStr);
+			board.makeMove(move);
+		}
+	} else if (input.starts_with("go ")) {
+		chess::Move move;
+		auto score = search(board, &move);
+		std::cout << "bestmove " << chess::uci::moveToUci(move) << std::endl;
+
+		dumpUciInfo(board, score);
+	} else if (input == "quit") {
+		return 0;
+	} else {
+		std::cout << "info string unknown command '" << input << "'" << std::endl;
+	}
+	*/
+
+	switch (state) {
+	case WAITING: {
+		if (!commandAvailable()) {
+			return;
+		}
+
+		auto command = readCommand();
+		if (command == "quit") {
+			exit(0);
+		} else if (command.starts_with("position startpos moves")) {
+			std::string moves = command.substr(24);
+			board = chess::Board::fromFen(std::string_view("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
+			std::vector<std::string> moveList = split(moves, ' ');
+			for (std::string moveStr : moveList) {
+				auto move = chess::uci::uciToMove(board, moveStr);
+				board.makeMove(move);
+			}
+		} else if (command.starts_with("go ")) {
+			startSearch();
+		} else {
+			std::cout << "info string unknown command '" << command << "'" << std::endl;
+		}
+	} break;
+	case THINKING: {
+		if (!commandAvailable()) {
+			return;
+		}
+
+		auto command = readCommand();
+		if (command == "quit") {
+			exit(0);
+		} else if (command == "stop") {
+			cancelSearch();
+		} else {
+			std::cout << "info string unknown command '" << command << "'" << std::endl;
+		}
+	} break;
+	}
+}
+
+bool shouldCancel(void) {
+	updateState();
+	return state == CANCELLING;
+}
+
 #if PROFILE_CUTOFF
 int totalBetaCutoffs = 0;
 int firstMoveBetaCutoffs = 0;
 #endif
 
 t_score quiescence(chess::Board &board, t_score alpha, t_score beta) {
+	if (shouldCancel()) {
+		return 0;
+	}
+
 	t_score standpat = evaluate(board);
 	if (standpat >= beta) {
 		return beta;
@@ -477,6 +657,10 @@ t_score quiescence(chess::Board &board, t_score alpha, t_score beta) {
 }
 
 t_score negamax(chess::Board &board, int depth, t_score alpha, t_score beta, chess::Move *bestMove) {
+	if (shouldCancel()) {
+		return 0;
+	}
+
 #if TT
 	uint64_t key = board.hash();
 	t_score ttScore;
@@ -502,7 +686,7 @@ t_score negamax(chess::Board &board, int depth, t_score alpha, t_score beta, che
 	chess::Movelist moves = generateMoves(board);
 	for (auto &move : moves) {
 		board.makeMove(move);
-		t_score score = -negamax(board, depth - 1, -beta, -alpha, nullptr);
+		t_score score = -negamax(board, depth - 1, -beta, -alpha, bestMove + 1);
 		board.unmakeMove(move);
 
 		if (score == SCORE_MAX) {
@@ -564,51 +748,43 @@ uint64_t timeFunc(std::function<void()> func) {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 }
 
-t_score search(chess::Board &board, chess::Move *bestMove) {
+t_score search(chess::Board &board) {
 #if PROFILE_CUTOFF
 	totalBetaCutoffs = 0;
 	firstMoveBetaCutoffs = 0;
 #endif
 
-	if (bestMove && getOpeningMove(board, bestMove)) {
-		return SCORE_ZERO;
-	}
-
+	t_score savedScore;
 	int depth = MIN_DEPTH;
 
 	while (true) {
         std::cout << "info depth " << depth << std::endl;
 
+		chess::Move line[MAX_DEPTH];
 		t_score score;
 		auto time = timeFunc([&]() {
-			score = negamax(board, depth, SCORE_MIN, SCORE_MAX, bestMove);
+			score = negamax(board, depth, SCORE_MIN, SCORE_MAX, line);
 		});
 
+		if (shouldCancel()) {
+			break;
+		}
+		savedScore = score;
+		memcpy(bestLine, line, sizeof(line));
+		bestLineLength = depth;
+
 		if (score == SCORE_MAX) {
-			return score;
+			break;
 		}
 
 		if (depth == MAX_DEPTH || time >= DYNAMIC_SEARCH_TIME_MS) {
-			return score;
+			break;
 		}
 
 		depth++;
 	}
-}
 
-std::vector<std::string> split(std::string str, char delim) {
-    std::vector<std::string> parts;
-    std::string part = "";
-    for (char c : str) {
-        if (c == delim) {
-            parts.push_back(part);
-            part = "";
-        } else {
-            part += c;
-        }
-    }
-    parts.push_back(part);
-    return parts;
+	return savedScore;
 }
 
 void dumpUciInfo(chess::Board &board, t_score score) {
@@ -634,44 +810,16 @@ void dumpUciInfo(chess::Board &board, t_score score) {
 }
 
 int main() {
-	chess::Board board;
-
 #ifdef TEST_POS
 	board = chess::Board::fromFen(TEST_POS);
 
-	chess::Move move;
-	auto score = search(board, &move);
-	std::cout << "bestmove " << chess::uci::moveToUci(move) << std::endl;
+	auto score = search(board);
+	std::cout << "bestmove " << chess::uci::moveToUci(bestLine[0]) << std::endl;
 
 	dumpUciInfo(board, score);
 #else
 	while (true) {
-        std::string input;
-        std::getline(std::cin, input);
-
-        if (input == "uci") {
-            std::cout << "uciok" << std::endl;
-        } else if (input == "isready") {
-            std::cout << "readyok" << std::endl;
-        } else if (input.starts_with("position startpos moves")) {
-            std::string moves = input.substr(24);
-            board = chess::Board::fromFen(std::string_view("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
-            std::vector<std::string> moveList = split(moves, ' ');
-            for (std::string moveStr : moveList) {
-                auto move = chess::uci::uciToMove(board, moveStr);
-                board.makeMove(move);
-            }
-        } else if (input.starts_with("go ")) {
-			chess::Move move;
-            auto score = search(board, &move);
-            std::cout << "bestmove " << chess::uci::moveToUci(move) << std::endl;
-
-			dumpUciInfo(board, score);
-        } else if (input == "quit") {
-            return 0;
-        } else {
-			std::cout << "info string unknown command '" << input << "'" << std::endl;
-		}
+        updateState();
     }
 #endif
 
