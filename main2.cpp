@@ -464,6 +464,7 @@ void storeTT(uint64_t key, int depth, t_score score, TTFlag flag, chess::Move be
 typedef enum {
 	WAITING,
 	THINKING,
+	PONDERING,
 	CANCELLING,
 } t_state;
 
@@ -471,42 +472,17 @@ t_state state = WAITING;
 chess::Move bestLine[MAX_DEPTH];
 size_t bestLineLength = 0;
 
+// index is the current move (hashed), for every move we can make, we store the best move for the opponent
+chess::Move nextMoveMap[4096];
+
+chess::Move expectedMove;
+
 void cancelSearch(void) {
 	std::cout << "info string cancelling search" << std::endl;
+	expectedMove = nextMoveMap[bestLine[0].from().index() * 64 + bestLine[0].to().index()];
+	std::cout << "info string best line: " << bestLine[0] << " " << expectedMove << std::endl;
+	std::cout << "bestmove " << chess::uci::moveToUci(bestLine[0]) << std::endl;
 	state = CANCELLING;
-}
-
-void handleCommand(char *input) {
-	if (strcmp(input, "uci") == 0) {
-		std::cout << "uciok" << std::endl;
-	} else if (strcmp(input, "isready") == 0) {
-		std::cout << "readyok" << std::endl;
-	} else if (strcmp(input, "ucinewgame") == 0) {
-#if TT
-		transpositionTable.clear();
-#endif
-	} else if (strcmp(input, "position") == 0) {
-		std::string moves = std::string(input).substr(24);
-		board = chess::Board::fromFen(std::string_view("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
-		std::vector<std::string> moveList = split(moves, ' ');
-		for (std::string moveStr : moveList) {
-			auto move = chess::uci::uciToMove(board, moveStr);
-			board.makeMove(move);
-		}
-		auto lastMove = chess::uci::uciToMove(board, moveList.back());
-		// cancel if we're not pondering this move
-		if (bestLine[0] != lastMove) {
-			cancelSearch();
-		}
-
-		state = THINKING;
-	} else if (strcmp(input, "go") == 0) {
-		// dont do anything. for now, position starts the search
-	} else if (strcmp(input, "stop") == 0) {
-		cancelSearch();
-	} else if (strcmp(input, "quit") == 0) {
-		exit(0);
-	}
 }
 
 bool commandAvailable() {
@@ -526,21 +502,29 @@ std::string readCommand() {
 
 t_score search(chess::Board &board);
 
+void startPondering() {
+	assert(state == THINKING);
+
+	std::cout << "info string pondering " << expectedMove << std::endl;
+	state = PONDERING;
+	board.makeMove(expectedMove);
+	auto score = search(board);
+}
+
 void startSearch() {
 	assert(state != THINKING);
 
 	std::cout << "info string starting search" << std::endl;
 	state = THINKING;
-	bestLineLength = 0;
 	auto score = search(board);
-	std::cout << "info string best line: ";
-	for (size_t i = 0; i < bestLineLength; i++) {
-		std::cout << chess::uci::moveToUci(bestLine[i]) << " ";
-	}
-	std::cout << std::endl;
+	expectedMove = nextMoveMap[bestLine[0].from().index() * 64 + bestLine[0].to().index()];
+	std::cout << "info string best line: " << bestLine[0] << " " << expectedMove << std::endl;
 	std::cout << "bestmove " << chess::uci::moveToUci(bestLine[0]) << std::endl;
-	state = WAITING;
+	board.makeMove(bestLine[0]);
+	startPondering();
 }
+
+chess::Board rollbackBoard;
 
 void updateState() {
 	/*
@@ -595,6 +579,39 @@ void updateState() {
 			std::cout << "info string unknown command '" << command << "'" << std::endl;
 		}
 	} break;
+	case PONDERING: {
+		if (!commandAvailable()) {
+			return;
+		}
+
+		// if we get a new position, if the move is the expected move, we can continue pondering, otherwise we need to cancel it
+
+		auto command = readCommand();
+		if (command == "quit") {
+			exit(0);
+		} else if (command.starts_with("position startpos moves")) {
+			std::string moves = command.substr(24);
+			auto localBoard = chess::Board::fromFen(std::string_view("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
+			std::vector<std::string> moveList = split(moves, ' ');
+			for (std::string moveStr : moveList) {
+				auto move = chess::uci::uciToMove(localBoard, moveStr);
+				localBoard.makeMove(move);
+			}
+			if (moveList.size() > 0) {
+				std::cout << "info string actually played move: " << moveList.back() << " expected move: " << expectedMove << std::endl;
+				if (moveList.back() == chess::uci::moveToUci(expectedMove)) {
+					state = THINKING;
+				} else {
+					cancelSearch();
+					rollbackBoard = localBoard;
+				}
+			}
+		} else if (command.starts_with("go ")) {
+			startSearch();
+		} else {
+			std::cout << "info string unknown command '" << command << "'" << std::endl;
+		}
+	} break;
 	case THINKING: {
 		if (!commandAvailable()) {
 			return;
@@ -609,6 +626,10 @@ void updateState() {
 			std::cout << "info string unknown command '" << command << "'" << std::endl;
 		}
 	} break;
+	case CANCELLING: {
+		board = rollbackBoard;
+		state = WAITING;
+	} break;
 	}
 }
 
@@ -622,8 +643,9 @@ int totalBetaCutoffs = 0;
 int firstMoveBetaCutoffs = 0;
 #endif
 
-t_score quiescence(chess::Board &board, t_score alpha, t_score beta) {
+t_score quiescence(chess::Board &board, t_score alpha, t_score beta, chess::Move prevMove) {
 	if (shouldCancel()) {
+		board.unmakeMove(prevMove);
 		return 0;
 	}
 
@@ -642,7 +664,7 @@ t_score quiescence(chess::Board &board, t_score alpha, t_score beta) {
 		}
 
 		board.makeMove(move);
-		t_score score = -quiescence(board, -beta, -alpha);
+		t_score score = -quiescence(board, -beta, -alpha, move);
 		board.unmakeMove(move);
 
 		if (score >= beta) {
@@ -656,8 +678,11 @@ t_score quiescence(chess::Board &board, t_score alpha, t_score beta) {
 	return alpha;
 }
 
-t_score negamax(chess::Board &board, int depth, t_score alpha, t_score beta, chess::Move *bestMove) {
+t_score negamax(chess::Board &board, int depth, t_score alpha, t_score beta, chess::Move *bestMove, int index = 0, chess::Move prevMove = chess::Move::NULL_MOVE) {
 	if (shouldCancel()) {
+		if (prevMove != chess::Move::NULL_MOVE) {
+			board.unmakeMove(prevMove);
+		}
 		return 0;
 	}
 
@@ -678,15 +703,15 @@ t_score negamax(chess::Board &board, int depth, t_score alpha, t_score beta, che
 #endif
 
 	if (depth == 0) {
-		return quiescence(board, alpha, beta);
+		return quiescence(board, alpha, beta, prevMove);
 	}
-	
+
 	t_score bestScore = SCORE_MIN;
 
 	chess::Movelist moves = generateMoves(board);
 	for (auto &move : moves) {
 		board.makeMove(move);
-		t_score score = -negamax(board, depth - 1, -beta, -alpha, bestMove + 1);
+		t_score score = -negamax(board, depth - 1, -beta, -alpha, bestMove + 1, index + 1, move);
 		board.unmakeMove(move);
 
 		if (score == SCORE_MAX) {
@@ -728,6 +753,9 @@ t_score negamax(chess::Board &board, int depth, t_score alpha, t_score beta, che
 
 	if (bestMove) {
 		*bestMove = bestLocalMove;
+	}
+	if (index == 1) {
+		nextMoveMap[prevMove.from().index() * 64 + prevMove.to().index()] = bestLocalMove;
 	}
 	return bestScore;
 }
